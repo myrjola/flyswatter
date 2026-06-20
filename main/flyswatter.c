@@ -21,7 +21,7 @@
 
 /* Most WS2812 panels are wired as a boustrophedon (serpentine): row 0 runs
  * left->right, row 1 right->left, and so on. Set to 0 for progressive wiring. */
-#define MATRIX_SERPENTINE 1
+#define MATRIX_SERPENTINE 0
 
 /* Global brightness cap (HSV "value", 0-255). Keeps current draw sane while
  * testing on USB power -- 264 LEDs at full white is ~15 A. */
