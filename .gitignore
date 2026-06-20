@@ -1,7 +1,8 @@
 # ESP-IDF build output
 build/
 
-# Generated sdkconfig backups (keep sdkconfig itself for the target/board config)
+# Generated sdkconfig (reproduced from sdkconfig.defaults) and backups
+sdkconfig
 sdkconfig.old
 sdkconfig.defaults.old
 
