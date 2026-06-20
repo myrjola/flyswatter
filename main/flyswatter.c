@@ -16,10 +16,8 @@
 #define MATRIX_HEIGHT  12
 #define MATRIX_PIXELS  (MATRIX_WIDTH * MATRIX_HEIGHT)   /* 264 LEDs */
 
-/* Data pin feeding the matrix' first pixel (DIN).
- * NOTE: GPIO8 is the onboard RGB LED on many ESP32-C3 dev boards; pick a free
- * pin if you wire an external matrix there. */
-#define MATRIX_GPIO    GPIO_NUM_10
+/* Data pin feeding the matrix' first pixel (DIN). */
+#define MATRIX_GPIO    GPIO_NUM_1
 
 /* Most WS2812 panels are wired as a boustrophedon (serpentine): row 0 runs
  * left->right, row 1 right->left, and so on. Set to 0 for progressive wiring. */
