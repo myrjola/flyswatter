@@ -9,7 +9,7 @@
 #include "led_strip.h"
 
 /* ======================================================================== */
-/* LED matrix (animated sunrise, runs as its own task)                      */
+/* LED matrix (animated thunderstorm, runs as its own task)                 */
 /* ======================================================================== */
 #define ENABLE_MATRIX   1      /* set 0 to silence the panel while bench-testing */
 
@@ -28,13 +28,17 @@
  * testing on USB power -- 264 LEDs at full white is ~15 A. */
 #define MATRIX_BRIGHTNESS 20
 
-/* Sunrise animation. The sun rises and sets on a slow triangle so the loop is
- * seamless; tweak SUN_CYCLE_S for speed and SUN_R for the disc size. */
-#define SUN_CYCLE_S      16.0f    /* seconds for a full rise+set sweep       */
-#define SUN_R            3.4f     /* sun disc radius, in pixels              */
-#define SUN_GLOW         5.0f     /* halo falloff distance beyond the disc   */
-#define SKY_MID          0.55f    /* height (0=top,1=bottom) of the mid stop */
-#define OUT_CAP          56       /* per-channel ceiling -> bounds current   */
+/* Thunderstorm animation: wind-blown rain over a dark sky, lit by random
+ * lightning. Tune the rain density, wind lean, and strike frequency here. */
+#define RAIN_DROPS       46       /* number of falling rain particles        */
+#define RAIN_STREAK      3        /* length of each drop's motion-blur tail  */
+#define RAIN_VMIN        0.55f    /* slowest fall speed, pixels/frame        */
+#define RAIN_VMAX        1.30f    /* fastest fall speed, pixels/frame        */
+#define RAIN_SLANT       0.35f    /* tail lean per step (matches the wind)   */
+#define WIND             0.14f    /* horizontal drift, pixels/frame          */
+#define LIGHTNING_P      0.012f   /* per-frame chance to start a strike      */
+#define FLASH_DECAY      0.55f    /* flash brightness retained each frame    */
+#define OUT_CAP          72       /* per-channel ceiling -> bounds current   */
 
 /* ======================================================================== */
 /* KY-039 heartbeat sensor -> onboard LED                                   */
@@ -88,21 +92,30 @@ static inline float lerpf(float a, float b, float t)
     return a + (b - a) * t;
 }
 
-/* Vertical sky gradient, full-intensity (0..255). t: 0 at the top of the panel,
- * 1 at the horizon. Indigo zenith -> magenta mid-sky -> warm orange horizon. */
-static void sky_color(float t, float *r, float *g, float *b)
+/* Cheap xorshift PRNG -- deterministic, no extra component needed. Seeded once
+ * from the timer so the storm differs run to run. */
+static uint32_t s_rng = 0x1234567u;
+static inline uint32_t rnd_u32(void)
 {
-    if (t < SKY_MID) {
-        float k = t / SKY_MID;
-        *r = lerpf(18.0f,  120.0f, k);   /* zenith -> mid */
-        *g = lerpf(14.0f,   38.0f, k);
-        *b = lerpf(64.0f,   96.0f, k);
-    } else {
-        float k = (t - SKY_MID) / (1.0f - SKY_MID);
-        *r = lerpf(120.0f, 255.0f, k);   /* mid -> horizon */
-        *g = lerpf( 38.0f, 120.0f, k);
-        *b = lerpf( 96.0f,  42.0f, k);
-    }
+    s_rng ^= s_rng << 13;
+    s_rng ^= s_rng >> 17;
+    s_rng ^= s_rng << 5;
+    return s_rng;
+}
+static inline float rnd_f(void)   /* uniform 0..1 */
+{
+    return (float)(rnd_u32() & 0xFFFFFFu) / (float)0x1000000u;
+}
+
+/* Linear-light accumulation buffer; the storm composites into this (rain and
+ * lightning add over the sky) and then it is flushed to the strip. */
+static float g_fb[MATRIX_PIXELS][3];
+
+static inline void fb_add(int x, int y, float r, float g, float b)
+{
+    if (x < 0 || x >= MATRIX_WIDTH || y < 0 || y >= MATRIX_HEIGHT) return;
+    int i = y * MATRIX_WIDTH + x;
+    g_fb[i][0] += r; g_fb[i][1] += g; g_fb[i][2] += b;
 }
 
 /* Scale a full-intensity RGB triple down to the panel's brightness budget and
@@ -138,58 +151,104 @@ static void matrix_task(void *arg)
     ESP_LOGI(TAG, "%dx%d matrix ready on GPIO%d (%d LEDs)",
              MATRIX_WIDTH, MATRIX_HEIGHT, MATRIX_GPIO, MATRIX_PIXELS);
 
-    const float sun_cx = (MATRIX_WIDTH - 1) / 2.0f;   /* horizontal centre */
+    /* Seed the PRNG from the boot clock so each power-up storms differently. */
+    s_rng = (uint32_t)esp_timer_get_time() | 1u;
+
+    /* Rain particles: position and per-drop fall speed. */
+    float drop_x[RAIN_DROPS], drop_y[RAIN_DROPS], drop_v[RAIN_DROPS];
+    for (int i = 0; i < RAIN_DROPS; i++) {
+        drop_x[i] = rnd_f() * MATRIX_WIDTH;
+        drop_y[i] = rnd_f() * MATRIX_HEIGHT;
+        drop_v[i] = lerpf(RAIN_VMIN, RAIN_VMAX, rnd_f());
+    }
+
+    float flash      = 0.0f;          /* whole-sky lightning glow, 1 -> 0     */
+    int   bolt_timer = 0;             /* frames the drawn bolt stays visible  */
+    int   bolt_x[MATRIX_HEIGHT];      /* jagged column of the current bolt    */
+    int   bolt_len = 0;
 
     while (1) {
-        /* Triangle phase p: 0 (sun below horizon) -> 1 (high) -> 0, seamless. */
-        float ts = (float)esp_timer_get_time() / 1e6f;
-        float pr = fmodf(ts / SUN_CYCLE_S, 1.0f);
-        float p  = (pr < 0.5f) ? (pr * 2.0f) : ((1.0f - pr) * 2.0f);
-
-        /* Pre-dawn is dim; the whole sky brightens as the sun climbs. */
-        float day = 0.22f + 0.78f * p;
-        /* Sun centre travels from just under the bottom edge up near the top. */
-        float sun_cy = lerpf((float)MATRIX_HEIGHT + 1.5f, 2.0f, p);
-
-        for (int y = 0; y < MATRIX_HEIGHT; y++) {
-            float th = (float)y / (float)(MATRIX_HEIGHT - 1);   /* 0 top..1 horizon */
-            float base_r, base_g, base_b;
-            sky_color(th, &base_r, &base_g, &base_b);
-            base_r *= day; base_g *= day; base_b *= day;
-
-            for (int x = 0; x < MATRIX_WIDTH; x++) {
-                float dx = (float)x - sun_cx;
-                float dy = (float)y - sun_cy;
-                float d  = sqrtf(dx * dx + dy * dy);
-
-                float r = base_r, g = base_g, b = base_b;
-
-                if (d <= SUN_R) {
-                    /* Disc: hot white-gold core fading to orange at the rim,
-                     * and redder overall while the sun is low on the horizon. */
-                    float f      = d / SUN_R;                 /* 0 core..1 rim */
-                    float redden = clampf(1.0f - p, 0.0f, 1.0f);
-                    float cr = 255.0f;
-                    float cg = lerpf(238.0f, 150.0f, f) - redden * 70.0f;
-                    float cb = lerpf(190.0f,  40.0f, f) - redden * 20.0f;
-                    float hot = 2.0f - f;                     /* brighten centre */
-                    r = cr * hot;
-                    g = clampf(cg, 0.0f, 255.0f) * hot;
-                    b = clampf(cb, 0.0f, 255.0f) * hot;
-                } else {
-                    /* Warm halo bleeding into the sky around the disc. */
-                    float glow = clampf(1.0f - (d - SUN_R) / SUN_GLOW, 0.0f, 1.0f);
-                    glow *= glow;
-                    r += 255.0f * glow * 0.9f;
-                    g += 130.0f * glow * 0.9f;
-                    b +=  40.0f * glow * 0.7f;
+        /* --- Lightning: maybe start a strike, or flicker an active one. --- */
+        if (flash < 0.03f) {
+            if (rnd_f() < LIGHTNING_P) {
+                flash      = 1.0f;
+                bolt_timer = 2 + (int)(rnd_u32() % 2);
+                bolt_len   = 7 + (int)(rnd_u32() % (MATRIX_HEIGHT - 6));
+                int bx = 2 + (int)(rnd_u32() % (MATRIX_WIDTH - 4));
+                for (int y = 0; y < bolt_len; y++) {
+                    bolt_x[y] = bx;
+                    bx += (int)(rnd_u32() % 3) - 1;          /* wander -1/0/+1 */
+                    if (bx < 0) bx = 0;
+                    if (bx >= MATRIX_WIDTH) bx = MATRIX_WIDTH - 1;
                 }
+            }
+        } else if (flash < 0.5f && rnd_f() < 0.30f) {
+            flash = 0.9f;                                     /* re-strike flicker */
+        }
 
-                put_px(strip, x, y, r, g, b);
+        /* --- Sky: dark storm gradient, lighter cloud deck up top. --- */
+        for (int y = 0; y < MATRIX_HEIGHT; y++) {
+            float t = (float)y / (float)(MATRIX_HEIGHT - 1); /* 0 top..1 bottom */
+            float r = lerpf(34.0f,  6.0f, t);
+            float g = lerpf(40.0f,  9.0f, t);
+            float b = lerpf(54.0f, 20.0f, t);
+            float fr = r, fg = g, fb = b;
+            for (int x = 0; x < MATRIX_WIDTH; x++) {
+                int i = y * MATRIX_WIDTH + x;
+                g_fb[i][0] = fr; g_fb[i][1] = fg; g_fb[i][2] = fb;
             }
         }
 
+        /* --- Rain: a bright head with a wind-leaned, fading tail. --- */
+        for (int i = 0; i < RAIN_DROPS; i++) {
+            for (int k = 0; k < RAIN_STREAK; k++) {
+                int yy = (int)drop_y[i] - k;
+                int xx = (int)(drop_x[i] - k * RAIN_SLANT);
+                float w = 1.0f - (float)k / RAIN_STREAK;     /* head brightest */
+                fb_add(xx, yy, 90.0f * w, 130.0f * w, 200.0f * w);
+            }
+        }
+
+        /* --- Lightning composite: whole-sky cool flash + the bright bolt. --- */
+        if (flash > 0.0f) {
+            float wash = flash * flash;                      /* punchier ramp */
+            for (int i = 0; i < MATRIX_PIXELS; i++) {
+                g_fb[i][0] += 170.0f * wash;
+                g_fb[i][1] += 185.0f * wash;
+                g_fb[i][2] += 230.0f * wash;
+            }
+        }
+        if (bolt_timer > 0) {
+            for (int y = 0; y < bolt_len; y++) {
+                fb_add(bolt_x[y],     y, 255.0f, 255.0f, 255.0f);
+                fb_add(bolt_x[y] - 1, y,  70.0f,  80.0f, 120.0f);   /* glow */
+                fb_add(bolt_x[y] + 1, y,  70.0f,  80.0f, 120.0f);
+            }
+        }
+
+        /* --- Flush the buffer to the panel. --- */
+        for (int y = 0; y < MATRIX_HEIGHT; y++) {
+            for (int x = 0; x < MATRIX_WIDTH; x++) {
+                int i = y * MATRIX_WIDTH + x;
+                put_px(strip, x, y, g_fb[i][0], g_fb[i][1], g_fb[i][2]);
+            }
+        }
         ESP_ERROR_CHECK(led_strip_refresh(strip));
+
+        /* --- Advance the simulation for the next frame. --- */
+        if (flash > 0.0f) { flash *= FLASH_DECAY; if (flash < 0.02f) flash = 0.0f; }
+        if (bolt_timer > 0) bolt_timer--;
+        for (int i = 0; i < RAIN_DROPS; i++) {
+            drop_y[i] += drop_v[i];
+            drop_x[i] += WIND;
+            if (drop_x[i] >= MATRIX_WIDTH) drop_x[i] -= MATRIX_WIDTH;
+            if (drop_y[i] - RAIN_STREAK > MATRIX_HEIGHT) {   /* fell off bottom */
+                drop_y[i] = -(rnd_f() * 3.0f);
+                drop_x[i] = rnd_f() * MATRIX_WIDTH;
+                drop_v[i] = lerpf(RAIN_VMIN, RAIN_VMAX, rnd_f());
+            }
+        }
+
         vTaskDelay(pdMS_TO_TICKS(33));   /* ~30 fps */
     }
 }
