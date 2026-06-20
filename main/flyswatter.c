@@ -103,13 +103,18 @@
 #define SONAR_MIN_US       100             /* reject implausibly short echoes (noise) */
 #define SONAR_MAX_US       30000
 #define SONAR_PLOT         0               /* stream "dist,<cm>"; collides with HB_PLOT, enable one */
-#define SONAR_DRIVES_VISUALS 1             /* distance-bar overlay below; 0 = pure dancer */
+#define SONAR_DRIVES_VISUALS 1             /* blue-particle fountain below; 0 = pure dancer */
 
-/* Distance-bar overlay tunables (used only when SONAR_DRIVES_VISUALS). */
-#define SONAR_NEAR_CM      5.0f            /* <= this -> full-height bars */
-#define SONAR_FAR_CM       50.0f           /* >= this (or no target) -> empty bars */
-#define SONAR_BAR_W        2               /* bar thickness in columns, each edge */
-#define SONAR_BAR_ALPHA    0.35f           /* EMA smoothing of bar height (anti-jitter) */
+/* Particle-fountain tunables (used only when SONAR_DRIVES_VISUALS). Blue sparks
+ * rise from the bottom toward the top; the closer the target, the more of them. */
+#define SONAR_NEAR_CM      5.0f            /* <= this -> peak spawn rate */
+#define SONAR_FAR_CM       50.0f           /* >= this (or no target) -> no spawns */
+#define PARTICLE_MAX       96              /* pool size (static, off the task stack) */
+#define PARTICLE_RATE      55.0f           /* spawns/sec at full closeness */
+#define PARTICLE_VY_MIN    0.18f           /* upward speed, rows/frame */
+#define PARTICLE_VY_MAX    0.45f
+#define PARTICLE_DRIFT     0.06f           /* sideways wander, rows/frame */
+#define PARTICLE_ALPHA     0.30f           /* EMA smoothing of closeness (anti-jitter) */
 
 static const char *TAG = "flyswatter";
 
@@ -161,6 +166,22 @@ static inline void put_px(led_strip_handle_t s, int x, int y, float r, float g, 
     int B = (int)clampf(b * k, 0.0f, (float)OUT_CAP);
     led_strip_set_pixel(s, xy_to_index(x, y), R, G, B);
 }
+
+#if SONAR_DRIVES_VISUALS
+/* Tiny xorshift PRNG for the particle fountain (seeded once from the boot clock). */
+static uint32_t s_rng = 0x2545F491u;
+static inline uint32_t rnd_u32(void)
+{
+    s_rng ^= s_rng << 13; s_rng ^= s_rng >> 17; s_rng ^= s_rng << 5;
+    return s_rng;
+}
+static inline float rnd_f(void) { return (rnd_u32() >> 8) * (1.0f / 16777216.0f); } /* [0,1) */
+
+/* Blue sparks rising bottom->top. Inactive when life <= 0. Pool lives in BSS,
+ * not on matrix_task's stack. */
+typedef struct { float x, y, vx, vy, life; } Particle;
+static Particle g_parts[PARTICLE_MAX];
+#endif
 
 /* ------------------------------------------------------------------------ */
 /* Dancer: pose -> skeleton -> anti-aliased bones                            */
@@ -456,6 +477,10 @@ static void matrix_task(void *arg)
     ESP_LOGI(TAG, "%dx%d matrix ready on GPIO%d (%d LEDs) -- disco dancer @ %d bpm",
              MATRIX_WIDTH, MATRIX_HEIGHT, MATRIX_GPIO, MATRIX_PIXELS, (int)BPM);
 
+#if SONAR_DRIVES_VISUALS
+    s_rng ^= (uint32_t)esp_timer_get_time() | 1u;   /* seed the particle PRNG */
+#endif
+
     while (1) {
         float ts = (float)esp_timer_get_time() / 1e6f;
         float b  = ts * (BPM / 60.0f);              /* beats elapsed */
@@ -479,23 +504,51 @@ static void matrix_task(void *arg)
         draw_figure(&sk);
 
 #if SONAR_DRIVES_VISUALS
-        /* Distance bars: cyan columns on the left/right edges that grow up from
-         * the bottom as a target nears (full at SONAR_NEAR_CM, empty by
-         * SONAR_FAR_CM or when there's no target). Composited additively so the
-         * centered dancer stays visible and put_px still gates the brightness. */
+        /* Blue-particle fountain: sparks rise from the bottom toward the top,
+         * and the closer the target the more we spawn. Composited additively
+         * over the dancer; put_px still gates the brightness/current. */
         {
-            static float bar_level = 0.0f;          /* smoothed 0..1 */
-            float d = g_distance_cm;                 /* single volatile read */
-            float frac = (d < 0.0f) ? 0.0f
+            static float close_s = 0.0f;     /* smoothed closeness 0..1 */
+            static float spawn_acc = 0.0f;   /* fractional spawn carry */
+            const float dt = 0.033f;         /* matches the ~30 fps frame delay */
+
+            float d = g_distance_cm;          /* single volatile read */
+            float close = (d < 0.0f) ? 0.0f
                 : clampf((SONAR_FAR_CM - d) / (SONAR_FAR_CM - SONAR_NEAR_CM), 0.0f, 1.0f);
-            bar_level += SONAR_BAR_ALPHA * (frac - bar_level);   /* EMA anti-jitter */
-            int h = (int)(bar_level * MATRIX_HEIGHT + 0.5f);
-            for (int row = 0; row < h; row++) {
-                int y = MATRIX_HEIGHT - 1 - row;     /* grow up from the bottom */
-                for (int c = 0; c < SONAR_BAR_W; c++) {
-                    fb_add(c, y, 0.0f, 200.0f, 255.0f);                    /* left bar  (cyan) */
-                    fb_add(MATRIX_WIDTH - 1 - c, y, 0.0f, 200.0f, 255.0f); /* right bar (cyan) */
+            close_s += PARTICLE_ALPHA * (close - close_s);   /* EMA anti-jitter */
+
+            /* Spawn from the bottom edge in proportion to closeness. */
+            spawn_acc += close_s * PARTICLE_RATE * dt;
+            while (spawn_acc >= 1.0f) {
+                spawn_acc -= 1.0f;
+                for (int i = 0; i < PARTICLE_MAX; i++) {
+                    if (g_parts[i].life <= 0.0f) {
+                        g_parts[i].x  = rnd_f() * MATRIX_WIDTH;
+                        g_parts[i].y  = MATRIX_HEIGHT - 1.0f;
+                        g_parts[i].vx = (rnd_f() - 0.5f) * 2.0f * PARTICLE_DRIFT;
+                        g_parts[i].vy = lerpf(PARTICLE_VY_MIN, PARTICLE_VY_MAX, rnd_f());
+                        g_parts[i].life = 1.0f;
+                        break;
+                    }
                 }
+            }
+
+            /* Advance and draw every live spark as a bright core + faint tail. */
+            for (int i = 0; i < PARTICLE_MAX; i++) {
+                if (g_parts[i].life <= 0.0f) continue;
+                g_parts[i].y  -= g_parts[i].vy;
+                g_parts[i].x  += g_parts[i].vx;
+                if (g_parts[i].y < -1.0f) { g_parts[i].life = 0.0f; continue; }
+
+                float fade = clampf(g_parts[i].y / 2.0f, 0.0f, 1.0f);  /* dim near the top */
+                int xi = (int)(g_parts[i].x + 0.5f);
+                int y0 = (int)floorf(g_parts[i].y);
+                float fy = g_parts[i].y - y0;                          /* sub-pixel split */
+                /* blue spark: low red, some green, full blue */
+                float cr = 30.0f * fade, cg = 90.0f * fade, cb = 255.0f * fade;
+                fb_add(xi, y0,     cr * (1.0f - fy), cg * (1.0f - fy), cb * (1.0f - fy));
+                fb_add(xi, y0 + 1, cr * fy,          cg * fy,          cb * fy);
+                fb_add(xi, y0 + 2, cr * 0.25f,       cg * 0.25f,       cb * 0.25f); /* tail */
             }
         }
 #endif
