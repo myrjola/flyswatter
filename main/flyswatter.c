@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -26,6 +27,17 @@
 /* Global brightness cap (HSV "value", 0-255). Keeps current draw sane while
  * testing on USB power -- 264 LEDs at full white is ~15 A. */
 #define MATRIX_BRIGHTNESS 20
+
+/* Layout: a throbbing heart up top, the BPM readout in the bottom rows. */
+#define HEART_ROWS       7        /* top rows reserved for the heart        */
+#define DIGIT_ROWS       5        /* bottom rows for the 3x5 BPM glyphs      */
+#define HEART_CX         10.5f    /* horizontal centre (width 22 => 0..21)  */
+#define HEART_CY         3.0f     /* row where the heart's math y == 0       */
+#define HEART_BASE_SX    4.2f     /* horizontal scale at rest                */
+#define HEART_BASE_SY    2.1f     /* vertical scale at rest                  */
+#define HEART_PULSE_AMP  0.30f    /* how much the heart grows on a beat      */
+#define HEART_PULSE_TAU  0.16f    /* throb decay time constant (seconds)     */
+#define HEART_FLARE      40       /* extra HSV value added at the beat peak  */
 
 /* ======================================================================== */
 /* KY-039 heartbeat sensor -> onboard LED                                   */
@@ -56,6 +68,26 @@
 
 static const char *TAG = "flyswatter";
 
+/* Published by the heartbeat detector (app_main), consumed by matrix_task.
+ * Plain 32-bit/64-bit loads and stores on the C3 are good enough here -- a
+ * one-frame tear on the timestamp would be invisible. */
+static volatile int     g_bpm          = 0;   /* smoothed beats per minute   */
+static volatile int64_t g_last_beat_us = 0;   /* esp_timer time of last beat */
+
+/* 3x5 pixel font for digits 0-9; bit 2 (0x4) is the leftmost column. */
+static const uint8_t FONT3x5[10][5] = {
+    {0x7, 0x5, 0x5, 0x5, 0x7},  /* 0 */
+    {0x2, 0x6, 0x2, 0x2, 0x7},  /* 1 */
+    {0x7, 0x1, 0x7, 0x4, 0x7},  /* 2 */
+    {0x7, 0x1, 0x7, 0x1, 0x7},  /* 3 */
+    {0x5, 0x5, 0x7, 0x1, 0x1},  /* 4 */
+    {0x7, 0x4, 0x7, 0x1, 0x7},  /* 5 */
+    {0x7, 0x4, 0x7, 0x5, 0x7},  /* 6 */
+    {0x7, 0x1, 0x2, 0x2, 0x2},  /* 7 */
+    {0x7, 0x5, 0x7, 0x5, 0x7},  /* 8 */
+    {0x7, 0x5, 0x7, 0x1, 0x7},  /* 9 */
+};
+
 /* ------------------------------------------------------------------------ */
 /* Matrix                                                                    */
 /* ------------------------------------------------------------------------ */
@@ -67,6 +99,39 @@ static inline uint32_t xy_to_index(int x, int y)
     }
 #endif
     return (uint32_t)(y * MATRIX_WIDTH + x);
+}
+
+/* Paint the BPM readout (or "--" before the first beat) centred in the bottom
+ * DIGIT_ROWS rows, using a soft pink so it reads apart from the red heart. */
+static void draw_bpm(led_strip_handle_t strip, int bpm)
+{
+    char buf[4];
+    int  n;
+    if (bpm > 0) {
+        if (bpm > 999) bpm = 999;
+        n = snprintf(buf, sizeof buf, "%d", bpm);
+    } else {
+        buf[0] = '-'; buf[1] = '-'; buf[2] = '\0'; n = 2;
+    }
+
+    int width = n * 3 + (n - 1);                 /* 3px glyphs + 1px gaps */
+    int ox    = (MATRIX_WIDTH - width) / 2;
+    int oy    = MATRIX_HEIGHT - DIGIT_ROWS;      /* bottom DIGIT_ROWS rows */
+
+    for (int i = 0; i < n; i++) {
+        char c = buf[i];
+        for (int row = 0; row < 5; row++) {
+            uint8_t bits = (c >= '0' && c <= '9') ? FONT3x5[c - '0'][row]
+                                                  : (row == 2 ? 0x7 : 0x0); /* '-' */
+            for (int col = 0; col < 3; col++) {
+                if (bits & (0x4 >> col)) {
+                    led_strip_set_pixel_hsv(strip,
+                        xy_to_index(ox + i * 4 + col, oy + row),
+                        330, 200, MATRIX_BRIGHTNESS);
+                }
+            }
+        }
+    }
 }
 
 static void matrix_task(void *arg)
@@ -91,18 +156,38 @@ static void matrix_task(void *arg)
     ESP_LOGI(TAG, "%dx%d matrix ready on GPIO%d (%d LEDs)",
              MATRIX_WIDTH, MATRIX_HEIGHT, MATRIX_GPIO, MATRIX_PIXELS);
 
-    uint16_t phase = 0;
     while (1) {
-        for (int y = 0; y < MATRIX_HEIGHT; y++) {
+        /* Throb envelope: 1.0 at the instant of a beat, decaying to 0. */
+        int64_t now   = esp_timer_get_time();
+        float   dt    = (float)(now - g_last_beat_us) / 1e6f;   /* s since beat */
+        float   pulse = expf(-dt / HEART_PULSE_TAU);
+        float   scale = 1.0f + HEART_PULSE_AMP * pulse;         /* grow on beat */
+        float   sx    = HEART_BASE_SX * scale;
+        float   sy    = HEART_BASE_SY * scale;
+        int     val   = MATRIX_BRIGHTNESS + (int)(pulse * HEART_FLARE);
+
+        /* Blank the panel, then paint the heart and the readout fresh. */
+        for (int i = 0; i < MATRIX_PIXELS; i++) {
+            led_strip_set_pixel(strip, i, 0, 0, 0);
+        }
+
+        /* Heart via the implicit curve (x^2+y^2-1)^3 - x^2*y^3 <= 0, with y up
+         * so the two lobes sit at the top and the point hangs below. */
+        for (int y = 0; y < HEART_ROWS; y++) {
             for (int x = 0; x < MATRIX_WIDTH; x++) {
-                uint16_t hue = (uint16_t)((x + y) * 12 + phase) % 360;
-                ESP_ERROR_CHECK(led_strip_set_pixel_hsv(
-                    strip, xy_to_index(x, y), hue, 255, MATRIX_BRIGHTNESS));
+                float fx = ((float)x - HEART_CX) / sx;
+                float fy = (HEART_CY - (float)y) / sy;
+                float a  = fx * fx + fy * fy - 1.0f;
+                if (a * a * a - fx * fx * fy * fy * fy <= 0.0f) {
+                    led_strip_set_pixel_hsv(strip, xy_to_index(x, y), 0, 255, val);
+                }
             }
         }
+
+        draw_bpm(strip, g_bpm);
+
         ESP_ERROR_CHECK(led_strip_refresh(strip));
-        phase = (phase + 6) % 360;
-        vTaskDelay(pdMS_TO_TICKS(40));
+        vTaskDelay(pdMS_TO_TICKS(33));   /* ~30 fps */
     }
 }
 
@@ -153,6 +238,7 @@ void app_main(void)
     bool was_above = false;
     int64_t last_beat_us = 0;
     int64_t led_off_at_us = 0;
+    float bpm_smooth = 0.0f;     /* EMA of the inter-beat rate for the panel */
 
     while (1) {
         int raw = 0;
@@ -172,11 +258,16 @@ void app_main(void)
         bool above = (acf > thr) && (acf > HB_MIN_AMPLITUDE);
 
         if (above && !was_above && (now - last_beat_us) > HB_REFRACTORY_US) {
-            int bpm = last_beat_us ? (int)(60000000LL / (now - last_beat_us)) : 0;
+            int inst = last_beat_us ? (int)(60000000LL / (now - last_beat_us)) : 0;
             last_beat_us = now;
             led_off_at_us = now + HB_FLASH_MS * 1000;
-            if (bpm) {
-                ESP_LOGI(TAG, "beat  ~%d bpm", bpm);
+            g_last_beat_us = now;        /* drives the matrix throb */
+            if (inst >= 30 && inst <= 220) {
+                bpm_smooth = (bpm_smooth <= 0.0f)
+                             ? (float)inst
+                             : bpm_smooth * 0.7f + (float)inst * 0.3f;
+                g_bpm = (int)(bpm_smooth + 0.5f);
+                ESP_LOGI(TAG, "beat  ~%d bpm", g_bpm);
             } else {
                 ESP_LOGI(TAG, "beat  (first)");
             }
