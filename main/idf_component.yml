@@ -1,0 +1,6 @@
+## IDF Component Manager manifest
+## Run `idf.py reconfigure` (or just build) to fetch declared dependencies.
+dependencies:
+  espressif/led_strip: "^3.0.3"
+  idf:
+    version: ">=5.0"
