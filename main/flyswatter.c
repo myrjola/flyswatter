@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"             /* for esp_rom_delay_us() */
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 #include "led_strip.h"
@@ -90,7 +91,32 @@
  * plotter -- handy for picking HB_MIN_AMPLITUDE and finger pressure. */
 #define HB_PLOT            1
 
+/* ------------------------------------------------------------------------ */
+/* HC-SR04 ultrasonic distance                                               */
+/* ------------------------------------------------------------------------ */
+#define ENABLE_SONAR       1
+#define SONAR_TRIG_GPIO    GPIO_NUM_6
+#define SONAR_ECHO_GPIO    GPIO_NUM_7      /* via 1k/2k divider -- Echo idles at 5V */
+#define SONAR_PING_MS      100             /* 10 Hz; HC-SR04 needs >60 ms between pings */
+#define SONAR_TIMEOUT_MS   30              /* ~5 m ceiling -> report no-target on timeout */
+#define SONAR_CM_PER_US    (1.0f / 58.0f)  /* round-trip speed of sound */
+#define SONAR_MIN_US       100             /* reject implausibly short echoes (noise) */
+#define SONAR_MAX_US       30000
+#define SONAR_PLOT         0               /* stream "dist,<cm>"; collides with HB_PLOT, enable one */
+#define SONAR_DRIVES_VISUALS 1             /* distance-bar overlay below; 0 = pure dancer */
+
+/* Distance-bar overlay tunables (used only when SONAR_DRIVES_VISUALS). */
+#define SONAR_NEAR_CM      5.0f            /* <= this -> full-height bars */
+#define SONAR_FAR_CM       50.0f           /* >= this (or no target) -> empty bars */
+#define SONAR_BAR_W        2               /* bar thickness in columns, each edge */
+#define SONAR_BAR_ALPHA    0.35f           /* EMA smoothing of bar height (anti-jitter) */
+
 static const char *TAG = "flyswatter";
+
+/* Latest ultrasonic distance in cm; <0 means "no target / out of range".
+ * Written by sonar_task, read by matrix_task. One writer, one reader, 32-bit
+ * aligned volatile float -> no tearing, no mutex needed on this MCU. */
+static volatile float g_distance_cm = -1.0f;
 
 /* ------------------------------------------------------------------------ */
 /* Matrix                                                                    */
@@ -452,6 +478,28 @@ static void matrix_task(void *arg)
         build_skeleton(&pose, &sk);
         draw_figure(&sk);
 
+#if SONAR_DRIVES_VISUALS
+        /* Distance bars: cyan columns on the left/right edges that grow up from
+         * the bottom as a target nears (full at SONAR_NEAR_CM, empty by
+         * SONAR_FAR_CM or when there's no target). Composited additively so the
+         * centered dancer stays visible and put_px still gates the brightness. */
+        {
+            static float bar_level = 0.0f;          /* smoothed 0..1 */
+            float d = g_distance_cm;                 /* single volatile read */
+            float frac = (d < 0.0f) ? 0.0f
+                : clampf((SONAR_FAR_CM - d) / (SONAR_FAR_CM - SONAR_NEAR_CM), 0.0f, 1.0f);
+            bar_level += SONAR_BAR_ALPHA * (frac - bar_level);   /* EMA anti-jitter */
+            int h = (int)(bar_level * MATRIX_HEIGHT + 0.5f);
+            for (int row = 0; row < h; row++) {
+                int y = MATRIX_HEIGHT - 1 - row;     /* grow up from the bottom */
+                for (int c = 0; c < SONAR_BAR_W; c++) {
+                    fb_add(c, y, 0.0f, 200.0f, 255.0f);                    /* left bar  (cyan) */
+                    fb_add(MATRIX_WIDTH - 1 - c, y, 0.0f, 200.0f, 255.0f); /* right bar (cyan) */
+                }
+            }
+        }
+#endif
+
         /* Flush the composed frame to the panel. */
         for (int y = 0; y < MATRIX_HEIGHT; y++) {
             for (int x = 0; x < MATRIX_WIDTH; x++) {
@@ -476,6 +524,66 @@ static inline void led_set(bool on)
 #endif
 }
 
+#if ENABLE_SONAR
+/* ------------------------------------------------------------------------ */
+/* HC-SR04 ultrasonic                                                        */
+/* ------------------------------------------------------------------------ */
+/* Non-blocking: a GPIO edge ISR timestamps the echo edges (preempts tasks,
+ * so the width stays accurate), and sonar_task *blocks* on a task notification
+ * instead of busy-spinning -- keeping the core free for the 30 fps dancer and
+ * the 50 Hz heartbeat sampler. */
+static TaskHandle_t s_sonar_task;
+
+static void IRAM_ATTR echo_isr(void *arg)
+{
+    static int64_t t_rise;
+    if (gpio_get_level(SONAR_ECHO_GPIO)) {              /* rising edge */
+        t_rise = esp_timer_get_time();
+    } else {                                            /* falling edge */
+        uint32_t width = (uint32_t)(esp_timer_get_time() - t_rise);
+        BaseType_t hpw = pdFALSE;
+        xTaskNotifyFromISR(s_sonar_task, width, eSetValueWithOverwrite, &hpw);
+        portYIELD_FROM_ISR(hpw);
+    }
+}
+
+static void sonar_task(void *arg)
+{
+    gpio_config_t trig = { .pin_bit_mask = 1ULL << SONAR_TRIG_GPIO,
+                           .mode = GPIO_MODE_OUTPUT };
+    gpio_config(&trig);
+    gpio_set_level(SONAR_TRIG_GPIO, 0);
+
+    gpio_config_t echo = { .pin_bit_mask = 1ULL << SONAR_ECHO_GPIO,
+                           .mode = GPIO_MODE_INPUT, .intr_type = GPIO_INTR_ANYEDGE };
+    gpio_config(&echo);
+
+    s_sonar_task = xTaskGetCurrentTaskHandle();         /* set BEFORE adding the ISR */
+    gpio_install_isr_service(0);                        /* INVALID_STATE if already installed -> ok */
+    gpio_isr_handler_add(SONAR_ECHO_GPIO, echo_isr, NULL);
+
+    ESP_LOGI(TAG, "sonar: HC-SR04 trig GPIO%d, echo GPIO%d", SONAR_TRIG_GPIO, SONAR_ECHO_GPIO);
+
+    while (1) {
+        gpio_set_level(SONAR_TRIG_GPIO, 1);             /* 10 us trigger pulse */
+        esp_rom_delay_us(10);                           /* the ONLY busy-wait, and it's tiny */
+        gpio_set_level(SONAR_TRIG_GPIO, 0);
+
+        uint32_t width = 0;
+        if (xTaskNotifyWait(0, 0, &width, pdMS_TO_TICKS(SONAR_TIMEOUT_MS)) == pdTRUE
+            && width >= SONAR_MIN_US && width <= SONAR_MAX_US) {
+            g_distance_cm = width * SONAR_CM_PER_US;
+        } else {
+            g_distance_cm = -1.0f;                       /* timeout: out of range / no target */
+        }
+#if SONAR_PLOT
+        printf("dist,%d\n", (int)g_distance_cm);
+#endif
+        vTaskDelay(pdMS_TO_TICKS(SONAR_PING_MS));
+    }
+}
+#endif /* ENABLE_SONAR */
+
 void app_main(void)
 {
     /* Onboard LED as output, start off. */
@@ -497,6 +605,10 @@ void app_main(void)
 
 #if ENABLE_MATRIX
     xTaskCreate(matrix_task, "matrix", 4096, NULL, 5, NULL);
+#endif
+
+#if ENABLE_SONAR
+    xTaskCreate(sonar_task, "sonar", 3072, NULL, 5, NULL);
 #endif
 
     ESP_LOGI(TAG, "heartbeat: sampling ADC1_CH%d, blinking LED on GPIO%d",
