@@ -333,8 +333,45 @@ static void mv_v(float b, Pose *p)
     p->lean = 0.0f;  p->hipShift = 0.0f;  p->bob = 0.5f * punch;
 }
 
+/* 7. Bodybuilder flex: upper arms held straight out to the sides, forearms
+ *    curling vertical -- one up, one down -- then smoothly swapping. */
+static void mv_flex(float b, Pose *p)
+{
+    float a = 0.5f + 0.5f * sinf(DANCE_PI * b);      /* 0..1, swaps each beat */
+    p->armR =  DANCE_PI * 0.5f;   /* upper arm out to screen-right, horizontal */
+    p->armL = -DANCE_PI * 0.5f;   /* upper arm out to screen-left,  horizontal */
+    p->foreR = lerpf(DANCE_PI, 0.0f, a);   /* a=1 -> up,   a=0 -> down */
+    p->foreL = lerpf(0.0f, DANCE_PI, a);   /* a=1 -> down, a=0 -> up   */
+    legs_stand(p, 0.2f);
+    p->lean     = 0.12f * (2.0f * a - 1.0f);   /* lean toward the raised arm */
+    p->hipShift = 0.0f;
+}
+
+/* 8. Moonwalk: glide all the way across, entering and leaving fully off-stage,
+ *    while the feet do a back-shuffle on the beat. Recreates the same per-move
+ *    phase sequence_pose() uses so the glide spans exactly one move slot, eased
+ *    so it dwells off-screen at both ends (crossfades land while invisible). */
+static void mv_moonwalk(float b, Pose *p)
+{
+    float movelen = (float)MOVE_BARS * 4.0f;
+    float u = b / movelen - floorf(b / movelen);    /* 0..1 across the slot */
+    float s = u * u * (3.0f - 2.0f * u);            /* ease in/out */
+    p->hipShift = lerpf(-16.0f, 16.0f, s);          /* off-left -> off-right */
+
+    float beatp = b - floorf(b);
+    float step  = sinf(2.0f * DANCE_PI * beatp);    /* foot shuffle on the beat */
+    p->legR  = DANCE_PI - 0.15f + 0.45f * step;
+    p->shinR = DANCE_PI - 0.05f + 0.30f * step;
+    p->legL  = DANCE_PI + 0.15f - 0.45f * step;
+    p->shinL = DANCE_PI + 0.05f - 0.30f * step;
+
+    p->lean  = -0.18f;                               /* lean back into the glide */
+    p->armR = DANCE_PI - 0.5f - 0.4f * step;  p->foreR = DANCE_PI - 0.4f - 0.3f * step;
+    p->armL = DANCE_PI + 0.5f + 0.4f * step;  p->foreL = DANCE_PI + 0.4f + 0.3f * step;
+}
+
 static const MoveFn MOVES[] = {
-    mv_point, mv_roof, mv_sway, mv_sprinkler, mv_shimmy, mv_v,
+    mv_point, mv_roof, mv_flex, mv_sway, mv_sprinkler, mv_shimmy, mv_v, mv_moonwalk,
 };
 #define NMOVES ((int)(sizeof(MOVES) / sizeof(MOVES[0])))
 
