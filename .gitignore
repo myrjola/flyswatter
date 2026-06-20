@@ -1,0 +1,20 @@
+# ESP-IDF build output
+build/
+
+# Generated sdkconfig backups (keep sdkconfig itself for the target/board config)
+sdkconfig.old
+sdkconfig.defaults.old
+
+# IDF component manager
+managed_components/
+dependencies.lock
+
+# CLion / JetBrains
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
