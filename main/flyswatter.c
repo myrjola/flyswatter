@@ -9,7 +9,7 @@
 #include "led_strip.h"
 
 /* ======================================================================== */
-/* LED matrix (sunrise -> day -> sunset -> starry night, as its own task)   */
+/* LED matrix (red stick figure dancing to a 4/4 disco beat, as its own task)*/
 /* ======================================================================== */
 #define ENABLE_MATRIX   1      /* set 0 to silence the panel while bench-testing */
 
@@ -28,14 +28,40 @@
  * testing on USB power -- 264 LEDs at full white is ~15 A. */
 #define MATRIX_BRIGHTNESS 20
 
-/* A full day/night cycle: dawn -> day -> a long sunset -> dusk -> a starry
- * night, then it loops seamlessly back through dawn. Stretch SKY_CYCLE_S to
- * slow the whole thing down. */
-#define SKY_CYCLE_S      64.0f    /* seconds for one full day/night loop      */
-#define SUN_R            3.2f     /* sun disc radius, in pixels               */
-#define SUN_GLOW         5.5f     /* halo falloff distance beyond the disc    */
-#define NSTARS           26       /* twinkling stars in the night sky         */
-#define OUT_CAP          56       /* per-channel ceiling -> bounds current    */
+/* A red stick figure grooving on a dark-green floor to a steady 4/4 beat,
+ * cycling smoothly through a handful of disco moves. Tempo and proportions
+ * below; the choreography lives in the move functions further down. */
+#define BPM            112.0f   /* moderate disco tempo (beats per minute)    */
+#define MOVE_BARS      4        /* bars (4 beats each) a move holds before    */
+                                /* it crossfades into the next                */
+#define XFADE_BEATS    1.0f     /* length of that crossfade, in beats         */
+#define OUT_CAP        56       /* per-channel ceiling -> bounds current      */
+
+/* Figure geometry, in matrix pixels (22 wide x 12 tall). The dancer is built
+ * by forward kinematics from a pelvis anchor each frame. */
+#define DANCE_PI    3.14159265f
+#define CX          10.5f       /* horizontal centre of the stage             */
+#define PELVIS_Y    7.0f        /* pelvis height (y grows downward)           */
+#define TORSO_LEN   3.2f        /* pelvis -> neck                             */
+#define UPPER_ARM   1.8f
+#define FOREARM     1.7f
+#define THIGH       2.0f
+#define SHIN        2.0f
+#define SHOULDER_W  1.1f        /* half-width of the shoulder line            */
+#define HIP_W       0.9f        /* half-width of the hip line                 */
+#define NECK_HEAD   0.6f        /* neck -> head-centre gap (beyond HEAD_R)     */
+#define HEAD_R      0.8f        /* head disc solid radius, px                 */
+#define LIMB_HALF   0.25f       /* limb solid half-thickness, px              */
+#define LIMB_AA     0.55f       /* anti-aliased feather beyond the solid core */
+
+/* Colours, authored at full intensity (0-255); put_px dims to the panel's
+ * brightness budget. Dark green stage, hot red dancer. */
+#define BG_R    0.0f
+#define BG_G   55.0f
+#define BG_B   12.0f
+#define FIG_R 255.0f
+#define FIG_G  18.0f
+#define FIG_B  14.0f
 
 /* ======================================================================== */
 /* KY-039 heartbeat sensor -> onboard LED                                   */
@@ -89,73 +115,14 @@ static inline float lerpf(float a, float b, float t)
     return a + (b - a) * t;
 }
 
-/* xorshift PRNG for one-time star placement; seeded from the boot clock. */
-static uint32_t s_rng = 0x2545F491u;
-static inline uint32_t rnd_u32(void)
-{
-    s_rng ^= s_rng << 13;
-    s_rng ^= s_rng >> 17;
-    s_rng ^= s_rng << 5;
-    return s_rng;
-}
-static inline float rnd_f(void) { return (float)(rnd_u32() & 0xFFFFFFu) / (float)0x1000000u; }
-
-/* Linear-light accumulation buffer: the sky fills it, then the sun and the
- * stars add their light over the top before it is flushed to the strip. */
+/* Linear-light accumulation buffer: the floor fills it, then the dancer's
+ * limbs add their light over the top before it is flushed to the strip. */
 static float g_fb[MATRIX_PIXELS][3];
 static inline void fb_add(int x, int y, float r, float g, float b)
 {
     if (x < 0 || x >= MATRIX_WIDTH || y < 0 || y >= MATRIX_HEIGHT) return;
     int i = y * MATRIX_WIDTH + x;
     g_fb[i][0] += r; g_fb[i][1] += g; g_fb[i][2] += b;
-}
-
-/* Timeline keyframes, all on one u-grid (u in [0,1) is the time of day). Node
- * order: night, dawn, day, golden, sunset, dusk, night -- so u=1 == u=0. */
-#define NKEY 7
-static const float KEY_U[NKEY]      = { 0.00f, 0.12f, 0.30f, 0.45f, 0.55f, 0.68f, 1.00f };
-static const float KEY_TOP[NKEY][3] = {   /* zenith (top row) colour */
-    {  0.0f,   1.0f,   6.0f },   /* night  */
-    { 45.0f,  55.0f, 120.0f },   /* dawn   */
-    { 60.0f, 115.0f, 195.0f },   /* day    */
-    { 50.0f,  50.0f, 120.0f },   /* golden */
-    { 80.0f,  35.0f,  95.0f },   /* sunset */
-    {  4.0f,   5.0f,  20.0f },   /* dusk   */
-    {  0.0f,   1.0f,   6.0f },   /* night  */
-};
-static const float KEY_HOR[NKEY][3] = {   /* horizon (bottom row) colour */
-    {  1.0f,   2.0f,   9.0f },
-    {255.0f, 160.0f,  80.0f },
-    {150.0f, 180.0f, 225.0f },
-    {255.0f, 170.0f,  70.0f },
-    {255.0f,  80.0f,  30.0f },
-    { 24.0f,  15.0f,  34.0f },
-    {  1.0f,   2.0f,   9.0f },
-};
-static const float KEY_SUNX[NKEY]   = { 2.0f,  4.0f, 11.0f, 15.0f, 18.0f, 20.0f, 21.0f };
-static const float KEY_SUNY[NKEY]   = { 15.0f, 8.0f,  2.5f,  6.0f, 10.5f, 15.0f, 16.0f };
-
-static float key_scalar(float u, const float v[])
-{
-    if (u <= KEY_U[0])      return v[0];
-    if (u >= KEY_U[NKEY-1]) return v[NKEY-1];
-    for (int i = 0; i < NKEY - 1; i++)
-        if (u < KEY_U[i+1]) {
-            float k = (u - KEY_U[i]) / (KEY_U[i+1] - KEY_U[i]);
-            return lerpf(v[i], v[i+1], k);
-        }
-    return v[NKEY-1];
-}
-static void key_vec3(float u, const float c[][3], float out[3])
-{
-    if (u <= KEY_U[0])      { out[0]=c[0][0]; out[1]=c[0][1]; out[2]=c[0][2]; return; }
-    if (u >= KEY_U[NKEY-1]) { int n=NKEY-1; out[0]=c[n][0]; out[1]=c[n][1]; out[2]=c[n][2]; return; }
-    for (int i = 0; i < NKEY - 1; i++)
-        if (u < KEY_U[i+1]) {
-            float k = (u - KEY_U[i]) / (KEY_U[i+1] - KEY_U[i]);
-            for (int j = 0; j < 3; j++) out[j] = lerpf(c[i][j], c[i+1][j], k);
-            return;
-        }
 }
 
 /* Scale a full-intensity RGB triple down to the panel's brightness budget and
@@ -167,6 +134,241 @@ static inline void put_px(led_strip_handle_t s, int x, int y, float r, float g, 
     int G = (int)clampf(g * k, 0.0f, (float)OUT_CAP);
     int B = (int)clampf(b * k, 0.0f, (float)OUT_CAP);
     led_strip_set_pixel(s, xy_to_index(x, y), R, G, B);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Dancer: pose -> skeleton -> anti-aliased bones                            */
+/* ------------------------------------------------------------------------ */
+
+/* A pose is just the joint angles of the figure plus a few whole-body offsets.
+ * Angles are absolute, measured clockwise from straight up (0 = up, +PI/2 =
+ * screen-right, -PI/2 = screen-left, PI = straight down). Each move below is a
+ * function of the running beat count that fills one of these in. */
+typedef struct {
+    float bob;        /* vertical lift, px (+ = up)                          */
+    float hipShift;   /* pelvis x offset, px                                 */
+    float lean;       /* torso lean from vertical, rad (+ = toward screen-R) */
+    float armL, foreL;  /* left  arm: shoulder & forearm angle               */
+    float armR, foreR;  /* right arm: shoulder & forearm angle               */
+    float legL, shinL;  /* left  leg: hip & shin angle                       */
+    float legR, shinR;  /* right leg: hip & shin angle                       */
+} Pose;
+
+typedef struct { float x, y; } Pt;
+
+/* Step from p by len along an absolute clock-from-up angle. */
+static inline Pt pt_step(Pt p, float len, float ang)
+{
+    Pt q = { p.x + len * sinf(ang), p.y - len * cosf(ang) };
+    return q;
+}
+
+typedef struct {
+    Pt pelvis, neck, head;
+    Pt shL, elbowL, handL,  shR, elbowR, handR;
+    Pt hipL, kneeL, footL,  hipR, kneeR, footR;
+} Skel;
+
+/* Forward kinematics: turn a pose into world-space joint positions. */
+static void build_skeleton(const Pose *p, Skel *s)
+{
+    Pt pelvis = { CX + p->hipShift, PELVIS_Y - p->bob };
+    /* torso "up" and a perpendicular pointing toward screen-right */
+    float ux = sinf(p->lean), uy = -cosf(p->lean);
+    float px = cosf(p->lean), py =  sinf(p->lean);
+
+    Pt neck = { pelvis.x + TORSO_LEN * ux, pelvis.y + TORSO_LEN * uy };
+    Pt head = { neck.x + (HEAD_R + NECK_HEAD) * ux,
+                neck.y + (HEAD_R + NECK_HEAD) * uy };
+
+    s->pelvis = pelvis;  s->neck = neck;  s->head = head;
+    s->shR = (Pt){ neck.x + SHOULDER_W * px, neck.y + SHOULDER_W * py };
+    s->shL = (Pt){ neck.x - SHOULDER_W * px, neck.y - SHOULDER_W * py };
+    s->hipR = (Pt){ pelvis.x + HIP_W * px, pelvis.y + HIP_W * py };
+    s->hipL = (Pt){ pelvis.x - HIP_W * px, pelvis.y - HIP_W * py };
+
+    s->elbowR = pt_step(s->shR, UPPER_ARM, p->armR);
+    s->handR  = pt_step(s->elbowR, FOREARM, p->foreR);
+    s->elbowL = pt_step(s->shL, UPPER_ARM, p->armL);
+    s->handL  = pt_step(s->elbowL, FOREARM, p->foreL);
+
+    s->kneeR = pt_step(s->hipR, THIGH, p->legR);
+    s->footR = pt_step(s->kneeR, SHIN, p->shinR);
+    s->kneeL = pt_step(s->hipL, THIGH, p->legL);
+    s->footL = pt_step(s->kneeL, SHIN, p->shinL);
+}
+
+/* Rasterise a capsule (line segment of half-thickness `half`) additively into
+ * g_fb, with a ~1px anti-aliased edge from distance-to-segment coverage. A
+ * degenerate segment (a == b) yields a filled disc -- that's how the head is
+ * drawn. */
+static void draw_bone(Pt a, Pt b, float half, float r, float g, float bl)
+{
+    float pad = half + LIMB_AA + 1.0f;
+    int x0 = (int)floorf(fminf(a.x, b.x) - pad);
+    int x1 = (int)ceilf (fmaxf(a.x, b.x) + pad);
+    int y0 = (int)floorf(fminf(a.y, b.y) - pad);
+    int y1 = (int)ceilf (fmaxf(a.y, b.y) + pad);
+    float vx = b.x - a.x, vy = b.y - a.y;
+    float vv = vx * vx + vy * vy;
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            float wx = (float)x - a.x, wy = (float)y - a.y;
+            float t  = vv > 1e-4f ? clampf((wx * vx + wy * vy) / vv, 0.0f, 1.0f) : 0.0f;
+            float dx = wx - t * vx, dy = wy - t * vy;
+            float d  = sqrtf(dx * dx + dy * dy);
+            float cov = clampf(1.0f - (d - half) / LIMB_AA, 0.0f, 1.0f);
+            if (cov > 0.0f) fb_add(x, y, r * cov, g * cov, bl * cov);
+        }
+    }
+}
+
+/* Draw the whole dancer in figure red. */
+static void draw_figure(const Skel *s)
+{
+    const float h = LIMB_HALF, R = FIG_R, G = FIG_G, B = FIG_B;
+    draw_bone(s->pelvis, s->neck, h, R, G, B);            /* spine            */
+    draw_bone(s->shL,    s->shR,  h * 0.8f, R, G, B);     /* shoulders        */
+    draw_bone(s->hipL,   s->hipR, h * 0.8f, R, G, B);     /* hips             */
+    draw_bone(s->shR, s->elbowR, h, R, G, B);  draw_bone(s->elbowR, s->handR, h, R, G, B);
+    draw_bone(s->shL, s->elbowL, h, R, G, B);  draw_bone(s->elbowL, s->handL, h, R, G, B);
+    draw_bone(s->hipR, s->kneeR, h, R, G, B);  draw_bone(s->kneeR, s->footR, h, R, G, B);
+    draw_bone(s->hipL, s->kneeL, h, R, G, B);  draw_bone(s->kneeL, s->footL, h, R, G, B);
+    draw_bone(s->head, s->head, HEAD_R, R, G, B);         /* head disc        */
+}
+
+/* ------------------------------------------------------------------------ */
+/* Choreography: each move is a function of the running beat count `b`        */
+/* (so fmodf(b,1) is the phase within the current quarter note, and a bar is  */
+/* 4 beats). Moves share the per-beat bounce added in matrix_task; here they  */
+/* only express their own style. They are blended pairwise to cross-fade.     */
+/* ------------------------------------------------------------------------ */
+typedef void (*MoveFn)(float b, Pose *p);
+
+/* A relaxed default stance the legs mostly keep; individual moves override. */
+static void legs_stand(Pose *p, float spread)
+{
+    p->legR = DANCE_PI - spread;  p->shinR = DANCE_PI - spread * 0.5f;
+    p->legL = DANCE_PI + spread;  p->shinL = DANCE_PI + spread * 0.5f;
+}
+
+/* 1. Saturday Night Fever point: one straight arm stabs up-diagonally, the
+ *    other rests low at the hip; the active side flips every two beats. */
+static void mv_point(float b, Pose *p)
+{
+    float seg  = floorf(b / 2.0f);                 /* switch sides every 2 beats */
+    int   right = ((int)fmodf(seg, 2.0f)) == 0;
+    float beatp = b - floorf(b);
+    float ext   = 0.18f * sinf(DANCE_PI * beatp);  /* a little stab on the beat  */
+    if (right) {
+        p->armR =  0.85f - ext;  p->foreR =  0.85f - ext;   /* up-right point */
+        p->armL =  DANCE_PI + 0.35f;  p->foreL = DANCE_PI + 0.15f;
+    } else {
+        p->armL = -(0.85f - ext); p->foreL = -(0.85f - ext); /* up-left point */
+        p->armR =  DANCE_PI - 0.35f;  p->foreR = DANCE_PI - 0.15f;
+    }
+    legs_stand(p, 0.22f);
+    p->lean     = right ?  0.12f : -0.12f;
+    p->hipShift = right ?  0.5f  : -0.5f;
+}
+
+/* 2. Raise the roof: both forearms punch upward on every beat. */
+static void mv_roof(float b, Pose *p)
+{
+    float beatp = b - floorf(b);
+    float push  = 0.5f + 0.5f * cosf(2.0f * DANCE_PI * beatp);  /* peak on beat */
+    p->armR =  0.7f;  p->foreR =  0.22f - 0.22f * push;   /* forearm -> vertical */
+    p->armL = -0.7f;  p->foreL = -0.22f + 0.22f * push;
+    legs_stand(p, 0.18f);
+    p->lean = 0.0f;  p->hipShift = 0.0f;  p->bob = 0.55f * push;
+}
+
+/* 3. Hip sway / side-step: weight rolls side to side, arms swing counter. */
+static void mv_sway(float b, Pose *p)
+{
+    float s = sinf(DANCE_PI * b);                   /* one sway per two beats */
+    p->hipShift = 1.4f * s;
+    p->lean     = 0.18f * s;
+    p->armR = DANCE_PI - 0.6f - 0.5f * s;  p->foreR = DANCE_PI - 0.5f - 0.4f * s;
+    p->armL = DANCE_PI + 0.6f - 0.5f * s;  p->foreL = DANCE_PI + 0.5f - 0.4f * s;
+    p->legR = DANCE_PI - 0.25f - 0.15f * s;  p->shinR = DANCE_PI - 0.12f;
+    p->legL = DANCE_PI + 0.25f - 0.15f * s;  p->shinL = DANCE_PI + 0.12f;
+}
+
+/* 4. Sprinkler: a straight arm sweeps slowly across, the other tucks behind
+ *    the head. */
+static void mv_sprinkler(float b, Pose *p)
+{
+    float sweep = 0.9f * sinf(DANCE_PI * b * 0.5f); /* slow front sweep */
+    p->armR = 0.2f + sweep;  p->foreR = 0.2f + sweep;
+    p->armL = -0.3f;         p->foreL = -1.4f;       /* bent behind head */
+    legs_stand(p, 0.2f);
+    p->lean     = 0.10f * sinf(DANCE_PI * b * 0.5f);
+    p->hipShift = 0.4f  * sinf(DANCE_PI * b * 0.5f);
+}
+
+/* 5. Shimmy bounce: knees bend on the beat while arms stick out and shake. */
+static void mv_shimmy(float b, Pose *p)
+{
+    float beatp = b - floorf(b);
+    float bend  = 0.5f + 0.5f * cosf(2.0f * DANCE_PI * beatp);
+    float sh    = 0.25f * sinf(4.0f * DANCE_PI * b);            /* fast shake */
+    p->armR =  DANCE_PI * 0.5f + 0.1f + sh;  p->foreR =  DANCE_PI * 0.5f - 0.2f + sh;
+    p->armL = -DANCE_PI * 0.5f - 0.1f + sh;  p->foreL = -DANCE_PI * 0.5f + 0.2f + sh;
+    p->legR = DANCE_PI - 0.28f;  p->shinR = DANCE_PI - 0.28f - 0.3f * bend;
+    p->legL = DANCE_PI + 0.28f;  p->shinL = DANCE_PI + 0.28f + 0.3f * bend;
+    p->lean = 0.0f;  p->hipShift = 0.0f;  p->bob = -0.6f * bend;
+}
+
+/* 6. Overhead V punch: both arms throw up into a V on each downbeat. */
+static void mv_v(float b, Pose *p)
+{
+    float beatp = b - floorf(b);
+    float punch = 0.5f + 0.5f * cosf(2.0f * DANCE_PI * beatp);
+    float spread = 0.6f - 0.25f * punch;            /* V narrows as it punches */
+    p->armR =  spread;  p->foreR =  spread;
+    p->armL = -spread;  p->foreL = -spread;
+    p->legR = DANCE_PI - 0.2f - 0.1f * punch;  p->shinR = DANCE_PI - 0.1f;
+    p->legL = DANCE_PI + 0.2f + 0.1f * punch;  p->shinL = DANCE_PI + 0.1f;
+    p->lean = 0.0f;  p->hipShift = 0.0f;  p->bob = 0.5f * punch;
+}
+
+static const MoveFn MOVES[] = {
+    mv_point, mv_roof, mv_sway, mv_sprinkler, mv_shimmy, mv_v,
+};
+#define NMOVES ((int)(sizeof(MOVES) / sizeof(MOVES[0])))
+
+#define POSE_BLEND(field) out->field = lerpf(a.field, c.field, t)
+static void blend_pose(Pose a, Pose c, float t, Pose *out)
+{
+    POSE_BLEND(bob);   POSE_BLEND(hipShift); POSE_BLEND(lean);
+    POSE_BLEND(armL);  POSE_BLEND(foreL);    POSE_BLEND(armR);  POSE_BLEND(foreR);
+    POSE_BLEND(legL);  POSE_BLEND(shinL);    POSE_BLEND(legR);  POSE_BLEND(shinR);
+}
+#undef POSE_BLEND
+
+/* Pick the current move from the running beat count, cross-fading into the
+ * next one over the final XFADE_BEATS of each move so the loop never snaps. */
+static void sequence_pose(float b, Pose *out)
+{
+    float movelen = (float)MOVE_BARS * 4.0f;        /* beats per move */
+    float mi  = b / movelen;
+    int   idx = (int)floorf(mi);
+    float frac = mi - (float)idx;                   /* 0..1 within the move */
+
+    Pose cur = (Pose){0};
+    MOVES[((idx % NMOVES) + NMOVES) % NMOVES](b, &cur);
+
+    float xf = XFADE_BEATS / movelen;               /* fraction spent fading */
+    if (frac > 1.0f - xf) {
+        float w = (frac - (1.0f - xf)) / xf;        /* 0..1 across the fade */
+        w = w * w * (3.0f - 2.0f * w);              /* smoothstep */
+        Pose nxt = (Pose){0};
+        MOVES[(((idx + 1) % NMOVES) + NMOVES) % NMOVES](b, &nxt);
+        blend_pose(cur, nxt, w, out);
+    } else {
+        *out = cur;
+    }
 }
 
 static void matrix_task(void *arg)
@@ -188,85 +390,30 @@ static void matrix_task(void *arg)
     led_strip_handle_t strip = NULL;
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &strip));
     ESP_ERROR_CHECK(led_strip_clear(strip));
-    ESP_LOGI(TAG, "%dx%d matrix ready on GPIO%d (%d LEDs)",
-             MATRIX_WIDTH, MATRIX_HEIGHT, MATRIX_GPIO, MATRIX_PIXELS);
-
-    /* Scatter the stars once across the upper sky (the bottom rows stay clear
-     * for the horizon glow). They persist for the life of the task. */
-    s_rng = (uint32_t)esp_timer_get_time() | 1u;
-    int   star_x[NSTARS], star_y[NSTARS];
-    float star_ph[NSTARS], star_sp[NSTARS], star_w[NSTARS];
-    for (int i = 0; i < NSTARS; i++) {
-        star_x[i]  = (int)(rnd_f() * MATRIX_WIDTH);
-        star_y[i]  = (int)(rnd_f() * (MATRIX_HEIGHT - 3));
-        star_ph[i] = rnd_f() * 6.2832f;             /* twinkle phase   */
-        star_sp[i] = lerpf(1.5f, 4.0f, rnd_f());    /* twinkle rate    */
-        star_w[i]  = lerpf(0.5f, 1.0f, rnd_f());    /* base brightness */
-    }
+    ESP_LOGI(TAG, "%dx%d matrix ready on GPIO%d (%d LEDs) -- disco dancer @ %d bpm",
+             MATRIX_WIDTH, MATRIX_HEIGHT, MATRIX_GPIO, MATRIX_PIXELS, (int)BPM);
 
     while (1) {
         float ts = (float)esp_timer_get_time() / 1e6f;
-        float u  = fmodf(ts / SKY_CYCLE_S, 1.0f);   /* time of day, 0..1 */
+        float b  = ts * (BPM / 60.0f);              /* beats elapsed */
+        float beatp = b - floorf(b);                /* phase within the beat */
 
-        float top[3], hor[3];
-        key_vec3(u, KEY_TOP, top);
-        key_vec3(u, KEY_HOR, hor);
-        float sun_cx = key_scalar(u, KEY_SUNX);
-        float sun_cy = key_scalar(u, KEY_SUNY);
-
-        /* The sun reddens as it nears the horizon and fades out below it. */
-        float redden = clampf((sun_cy - 2.5f) / 8.0f, 0.0f, 1.0f);
-        float sun_up = clampf((13.5f - sun_cy) / 4.0f, 0.0f, 1.0f);
-
-        /* Stars fade in once the zenith goes dark (low top-of-sky luminance). */
-        float tmax = top[0] > top[1] ? (top[0] > top[2] ? top[0] : top[2])
-                                     : (top[1] > top[2] ? top[1] : top[2]);
-        float star_vis = clampf((46.0f - tmax) / 34.0f, 0.0f, 1.0f);
-
-        /* Sky gradient (top->horizon) plus the sun, composited into the buffer. */
-        for (int y = 0; y < MATRIX_HEIGHT; y++) {
-            float t  = (float)y / (float)(MATRIX_HEIGHT - 1);
-            float sr = lerpf(top[0], hor[0], t);
-            float sg = lerpf(top[1], hor[1], t);
-            float sb = lerpf(top[2], hor[2], t);
-            for (int x = 0; x < MATRIX_WIDTH; x++) {
-                float r = sr, g = sg, b = sb;
-                float dx = (float)x - sun_cx;
-                float dy = (float)y - sun_cy;
-                float d  = sqrtf(dx * dx + dy * dy);
-
-                if (d <= SUN_R) {
-                    float f   = d / SUN_R;                    /* 0 core..1 rim */
-                    float cr  = 255.0f;
-                    float cg  = lerpf(238.0f, 150.0f, f) - redden * 80.0f;
-                    float cb  = lerpf(190.0f,  40.0f, f) - redden * 30.0f;
-                    float hot = (2.0f - f) * sun_up;          /* dim as it sets */
-                    r = cr * hot;
-                    g = clampf(cg, 0.0f, 255.0f) * hot;
-                    b = clampf(cb, 0.0f, 255.0f) * hot;
-                } else {
-                    /* Warm halo, redder at sunset, gone once the sun is down. */
-                    float glow = clampf(1.0f - (d - SUN_R) / SUN_GLOW, 0.0f, 1.0f);
-                    glow = glow * glow * sun_up;
-                    r += 255.0f                       * glow * 0.9f;
-                    g += lerpf(170.0f, 110.0f, redden) * glow * 0.9f;
-                    b += lerpf( 90.0f,  35.0f, redden) * glow * 0.7f;
-                }
-
-                int i = y * MATRIX_WIDTH + x;
-                g_fb[i][0] = r; g_fb[i][1] = g; g_fb[i][2] = b;
-            }
+        /* Dark-green floor with a subtle pulse that swells on each beat. */
+        float pulse = 0.5f + 0.5f * cosf(2.0f * DANCE_PI * beatp);
+        float gr = BG_R;
+        float gg = BG_G * (1.0f + 0.40f * pulse);
+        float gb = BG_B * (1.0f + 0.40f * pulse);
+        for (int i = 0; i < MATRIX_PIXELS; i++) {
+            g_fb[i][0] = gr; g_fb[i][1] = gg; g_fb[i][2] = gb;
         }
 
-        /* Twinkling stars on top, brightening as night deepens. */
-        if (star_vis > 0.0f) {
-            for (int i = 0; i < NSTARS; i++) {
-                float tw = 0.45f + 0.55f * sinf(star_ph[i] + ts * star_sp[i]);
-                if (tw < 0.0f) tw = 0.0f;
-                float a = star_vis * star_w[i] * tw;
-                fb_add(star_x[i], star_y[i], 230.0f * a, 240.0f * a, 255.0f * a);
-            }
-        }
+        /* Choreograph, add the shared per-beat knee-dip bounce, draw. */
+        Pose pose;
+        sequence_pose(b, &pose);
+        pose.bob += -0.5f * (0.5f + 0.5f * cosf(2.0f * DANCE_PI * beatp));
+        Skel sk;
+        build_skeleton(&pose, &sk);
+        draw_figure(&sk);
 
         /* Flush the composed frame to the panel. */
         for (int y = 0; y < MATRIX_HEIGHT; y++) {
@@ -276,7 +423,7 @@ static void matrix_task(void *arg)
             }
         }
         ESP_ERROR_CHECK(led_strip_refresh(strip));
-        vTaskDelay(pdMS_TO_TICKS(40));   /* ~25 fps */
+        vTaskDelay(pdMS_TO_TICKS(33));   /* ~30 fps */
     }
 }
 
