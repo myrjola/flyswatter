@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 560" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="ahb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M1 1 L9 5 L1 9" fill="none" stroke="#0969da" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M1 1 L9 5 L1 9" fill="none" stroke="#6e7781" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <style>
+      .box  { fill:#f6f8fa; stroke:#57606a; stroke-width:1; }
+      .board{ fill:#ddf4ff; stroke:#0969da; stroke-width:1.5; }
+      .div  { fill:#fff8c5; stroke:#9a6700; stroke-width:1; }
+      .t    { fill:#1f2328; font-size:13px; }
+      .th   { fill:#1f2328; font-size:14px; font-weight:600; }
+      .ti   { fill:#1f2328; font-size:16px; font-weight:700; }
+      .ts   { fill:#57606a; font-size:11px; }
+      .sig  { stroke:#0969da; stroke-width:2; fill:none; }
+      .pwr  { stroke:#6e7781; stroke-width:2; fill:none; }
+      .warn { fill:#9a6700; font-size:11px; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="840" height="560" fill="#ffffff"/>
+  <text x="420" y="30" text-anchor="middle" class="ti">flyswatter — connection diagram</text>
+
+  <!-- Board -->
+  <rect x="330" y="215" width="180" height="140" rx="10" class="board"/>
+  <text x="420" y="250" text-anchor="middle" class="th">ESP32-C3</text>
+  <text x="420" y="268" text-anchor="middle" class="ts">SuperMini · USB-C</text>
+  <text x="420" y="312" text-anchor="middle" class="ts">onboard LED: GPIO8</text>
+  <text x="420" y="328" text-anchor="middle" class="ts">(heartbeat blink)</text>
+
+  <!-- Matrix (top) -->
+  <rect x="300" y="55" width="240" height="86" rx="10" class="box"/>
+  <text x="420" y="82" text-anchor="middle" class="th">WS2812 matrix</text>
+  <text x="420" y="103" text-anchor="middle" class="ts">22 × 12 = 264 LEDs · GRB</text>
+  <text x="420" y="121" text-anchor="middle" class="ts">power: 5V + GND</text>
+  <line x1="420" y1="215" x2="420" y2="141" class="sig" marker-end="url(#ahb)"/>
+  <text x="430" y="182" class="t">GPIO1 → DIN</text>
+
+  <!-- KY-039 (bottom) -->
+  <rect x="300" y="430" width="240" height="86" rx="10" class="box"/>
+  <text x="420" y="457" text-anchor="middle" class="th">KY-039 heartbeat</text>
+  <text x="420" y="478" text-anchor="middle" class="ts">analog pulse sensor</text>
+  <text x="420" y="496" text-anchor="middle" class="ts">power: 3V3 + GND</text>
+  <line x1="420" y1="430" x2="420" y2="355" class="sig" marker-end="url(#ahb)"/>
+  <text x="430" y="396" class="t">GPIO0 ← S (ADC1_CH0)</text>
+
+  <!-- HC-SR04 (right) -->
+  <rect x="600" y="225" width="210" height="120" rx="10" class="box"/>
+  <text x="705" y="252" text-anchor="middle" class="th">HC-SR04 ultrasonic</text>
+  <text x="705" y="273" text-anchor="middle" class="ts">power: 5V + GND</text>
+  <text x="705" y="305" text-anchor="middle" class="ts">distance → particle</text>
+  <text x="705" y="321" text-anchor="middle" class="ts">fountain overlay</text>
+  <!-- Trig -->
+  <line x1="510" y1="262" x2="600" y2="255" class="sig" marker-end="url(#ahb)"/>
+  <text x="520" y="247" class="ts">GPIO6 → Trig</text>
+  <!-- Echo via divider -->
+  <line x1="600" y1="305" x2="594" y2="305" class="sig"/>
+  <rect x="550" y="295" width="44" height="20" rx="4" class="div"/>
+  <text x="572" y="305" text-anchor="middle" class="ts" dominant-baseline="central">1k/2k</text>
+  <line x1="550" y1="305" x2="510" y2="305" class="sig" marker-end="url(#ahb)"/>
+  <text x="520" y="332" class="ts">GPIO7 ← Echo</text>
+
+  <!-- Power (left) -->
+  <rect x="30" y="235" width="180" height="110" rx="10" class="box"/>
+  <text x="120" y="262" text-anchor="middle" class="th">USB-C 5V in</text>
+  <text x="120" y="286" text-anchor="middle" class="ts">5V rail (passthrough)</text>
+  <text x="120" y="304" text-anchor="middle" class="ts">3V3 (on-board reg)</text>
+  <text x="120" y="322" text-anchor="middle" class="ts">common GND</text>
+  <line x1="210" y1="285" x2="330" y2="285" class="pwr" marker-end="url(#ahg)"/>
+  <text x="270" y="278" text-anchor="middle" class="ts">5V · 3V3 · GND</text>
+
+  <!-- Footnotes -->
+  <text x="30" y="536" class="ts">All grounds common · Matrix + HC-SR04 run on 5V (USB passthrough) · KY-039 runs on 3V3.</text>
+  <text x="30" y="552" class="warn">HC-SR04 Echo idles at 5V → 1kΩ/2kΩ divider drops it to ~3.3V before GPIO7 (ESP32-C3 GPIOs are NOT 5V-tolerant).</text>
+</svg>
