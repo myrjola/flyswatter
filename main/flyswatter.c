@@ -20,7 +20,7 @@
 
 /* Global brightness cap (HSV "value", 0-255). Keeps current draw sane while
  * testing on USB power -- 264 LEDs at full white is ~15 A. */
-#define MATRIX_BRIGHTNESS 40
+#define MATRIX_BRIGHTNESS 20
 
 static const char *TAG = "matrix";
 
