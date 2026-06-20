@@ -9,7 +9,7 @@
 #include "led_strip.h"
 
 /* ======================================================================== */
-/* LED matrix (hello-world rainbow, runs as its own task)                   */
+/* LED matrix (animated sunrise, runs as its own task)                      */
 /* ======================================================================== */
 #define ENABLE_MATRIX   1      /* set 0 to silence the panel while bench-testing */
 
@@ -28,16 +28,13 @@
  * testing on USB power -- 264 LEDs at full white is ~15 A. */
 #define MATRIX_BRIGHTNESS 20
 
-/* Layout: a throbbing heart up top, the BPM readout in the bottom rows. */
-#define HEART_ROWS       7        /* top rows reserved for the heart        */
-#define DIGIT_ROWS       5        /* bottom rows for the 3x5 BPM glyphs      */
-#define HEART_CX         10.5f    /* horizontal centre (width 22 => 0..21)  */
-#define HEART_CY         3.0f     /* row where the heart's math y == 0       */
-#define HEART_BASE_SX    4.2f     /* horizontal scale at rest                */
-#define HEART_BASE_SY    2.1f     /* vertical scale at rest                  */
-#define HEART_PULSE_AMP  0.30f    /* how much the heart grows on a beat      */
-#define HEART_PULSE_TAU  0.16f    /* throb decay time constant (seconds)     */
-#define HEART_FLARE      40       /* extra HSV value added at the beat peak  */
+/* Sunrise animation. The sun rises and sets on a slow triangle so the loop is
+ * seamless; tweak SUN_CYCLE_S for speed and SUN_R for the disc size. */
+#define SUN_CYCLE_S      16.0f    /* seconds for a full rise+set sweep       */
+#define SUN_R            3.4f     /* sun disc radius, in pixels              */
+#define SUN_GLOW         5.0f     /* halo falloff distance beyond the disc   */
+#define SKY_MID          0.55f    /* height (0=top,1=bottom) of the mid stop */
+#define OUT_CAP          56       /* per-channel ceiling -> bounds current   */
 
 /* ======================================================================== */
 /* KY-039 heartbeat sensor -> onboard LED                                   */
@@ -68,26 +65,6 @@
 
 static const char *TAG = "flyswatter";
 
-/* Published by the heartbeat detector (app_main), consumed by matrix_task.
- * Plain 32-bit/64-bit loads and stores on the C3 are good enough here -- a
- * one-frame tear on the timestamp would be invisible. */
-static volatile int     g_bpm          = 0;   /* smoothed beats per minute   */
-static volatile int64_t g_last_beat_us = 0;   /* esp_timer time of last beat */
-
-/* 3x5 pixel font for digits 0-9; bit 2 (0x4) is the leftmost column. */
-static const uint8_t FONT3x5[10][5] = {
-    {0x7, 0x5, 0x5, 0x5, 0x7},  /* 0 */
-    {0x2, 0x6, 0x2, 0x2, 0x7},  /* 1 */
-    {0x7, 0x1, 0x7, 0x4, 0x7},  /* 2 */
-    {0x7, 0x1, 0x7, 0x1, 0x7},  /* 3 */
-    {0x5, 0x5, 0x7, 0x1, 0x1},  /* 4 */
-    {0x7, 0x4, 0x7, 0x1, 0x7},  /* 5 */
-    {0x7, 0x4, 0x7, 0x5, 0x7},  /* 6 */
-    {0x7, 0x1, 0x2, 0x2, 0x2},  /* 7 */
-    {0x7, 0x5, 0x7, 0x5, 0x7},  /* 8 */
-    {0x7, 0x5, 0x7, 0x1, 0x7},  /* 9 */
-};
-
 /* ------------------------------------------------------------------------ */
 /* Matrix                                                                    */
 /* ------------------------------------------------------------------------ */
@@ -101,37 +78,42 @@ static inline uint32_t xy_to_index(int x, int y)
     return (uint32_t)(y * MATRIX_WIDTH + x);
 }
 
-/* Paint the BPM readout (or "--" before the first beat) centred in the bottom
- * DIGIT_ROWS rows, using a soft pink so it reads apart from the red heart. */
-static void draw_bpm(led_strip_handle_t strip, int bpm)
+static inline float clampf(float v, float lo, float hi)
 {
-    char buf[4];
-    int  n;
-    if (bpm > 0) {
-        if (bpm > 999) bpm = 999;
-        n = snprintf(buf, sizeof buf, "%d", bpm);
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static inline float lerpf(float a, float b, float t)
+{
+    return a + (b - a) * t;
+}
+
+/* Vertical sky gradient, full-intensity (0..255). t: 0 at the top of the panel,
+ * 1 at the horizon. Indigo zenith -> magenta mid-sky -> warm orange horizon. */
+static void sky_color(float t, float *r, float *g, float *b)
+{
+    if (t < SKY_MID) {
+        float k = t / SKY_MID;
+        *r = lerpf(18.0f,  120.0f, k);   /* zenith -> mid */
+        *g = lerpf(14.0f,   38.0f, k);
+        *b = lerpf(64.0f,   96.0f, k);
     } else {
-        buf[0] = '-'; buf[1] = '-'; buf[2] = '\0'; n = 2;
+        float k = (t - SKY_MID) / (1.0f - SKY_MID);
+        *r = lerpf(120.0f, 255.0f, k);   /* mid -> horizon */
+        *g = lerpf( 38.0f, 120.0f, k);
+        *b = lerpf( 96.0f,  42.0f, k);
     }
+}
 
-    int width = n * 3 + (n - 1);                 /* 3px glyphs + 1px gaps */
-    int ox    = (MATRIX_WIDTH - width) / 2;
-    int oy    = MATRIX_HEIGHT - DIGIT_ROWS;      /* bottom DIGIT_ROWS rows */
-
-    for (int i = 0; i < n; i++) {
-        char c = buf[i];
-        for (int row = 0; row < 5; row++) {
-            uint8_t bits = (c >= '0' && c <= '9') ? FONT3x5[c - '0'][row]
-                                                  : (row == 2 ? 0x7 : 0x0); /* '-' */
-            for (int col = 0; col < 3; col++) {
-                if (bits & (0x4 >> col)) {
-                    led_strip_set_pixel_hsv(strip,
-                        xy_to_index(ox + i * 4 + col, oy + row),
-                        330, 200, MATRIX_BRIGHTNESS);
-                }
-            }
-        }
-    }
+/* Scale a full-intensity RGB triple down to the panel's brightness budget and
+ * push it to the strip, clamping per channel to keep total current in check. */
+static inline void put_px(led_strip_handle_t s, int x, int y, float r, float g, float b)
+{
+    const float k = (float)MATRIX_BRIGHTNESS / 255.0f;
+    int R = (int)clampf(r * k, 0.0f, (float)OUT_CAP);
+    int G = (int)clampf(g * k, 0.0f, (float)OUT_CAP);
+    int B = (int)clampf(b * k, 0.0f, (float)OUT_CAP);
+    led_strip_set_pixel(s, xy_to_index(x, y), R, G, B);
 }
 
 static void matrix_task(void *arg)
@@ -156,35 +138,56 @@ static void matrix_task(void *arg)
     ESP_LOGI(TAG, "%dx%d matrix ready on GPIO%d (%d LEDs)",
              MATRIX_WIDTH, MATRIX_HEIGHT, MATRIX_GPIO, MATRIX_PIXELS);
 
+    const float sun_cx = (MATRIX_WIDTH - 1) / 2.0f;   /* horizontal centre */
+
     while (1) {
-        /* Throb envelope: 1.0 at the instant of a beat, decaying to 0. */
-        int64_t now   = esp_timer_get_time();
-        float   dt    = (float)(now - g_last_beat_us) / 1e6f;   /* s since beat */
-        float   pulse = expf(-dt / HEART_PULSE_TAU);
-        float   scale = 1.0f + HEART_PULSE_AMP * pulse;         /* grow on beat */
-        float   sx    = HEART_BASE_SX * scale;
-        float   sy    = HEART_BASE_SY * scale;
-        int     val   = MATRIX_BRIGHTNESS + (int)(pulse * HEART_FLARE);
+        /* Triangle phase p: 0 (sun below horizon) -> 1 (high) -> 0, seamless. */
+        float ts = (float)esp_timer_get_time() / 1e6f;
+        float pr = fmodf(ts / SUN_CYCLE_S, 1.0f);
+        float p  = (pr < 0.5f) ? (pr * 2.0f) : ((1.0f - pr) * 2.0f);
 
-        /* Blank the panel, then paint the heart and the readout fresh. */
-        for (int i = 0; i < MATRIX_PIXELS; i++) {
-            led_strip_set_pixel(strip, i, 0, 0, 0);
-        }
+        /* Pre-dawn is dim; the whole sky brightens as the sun climbs. */
+        float day = 0.22f + 0.78f * p;
+        /* Sun centre travels from just under the bottom edge up near the top. */
+        float sun_cy = lerpf((float)MATRIX_HEIGHT + 1.5f, 2.0f, p);
 
-        /* Heart via the implicit curve (x^2+y^2-1)^3 - x^2*y^3 <= 0, with y up
-         * so the two lobes sit at the top and the point hangs below. */
-        for (int y = 0; y < HEART_ROWS; y++) {
+        for (int y = 0; y < MATRIX_HEIGHT; y++) {
+            float th = (float)y / (float)(MATRIX_HEIGHT - 1);   /* 0 top..1 horizon */
+            float base_r, base_g, base_b;
+            sky_color(th, &base_r, &base_g, &base_b);
+            base_r *= day; base_g *= day; base_b *= day;
+
             for (int x = 0; x < MATRIX_WIDTH; x++) {
-                float fx = ((float)x - HEART_CX) / sx;
-                float fy = (HEART_CY - (float)y) / sy;
-                float a  = fx * fx + fy * fy - 1.0f;
-                if (a * a * a - fx * fx * fy * fy * fy <= 0.0f) {
-                    led_strip_set_pixel_hsv(strip, xy_to_index(x, y), 0, 255, val);
+                float dx = (float)x - sun_cx;
+                float dy = (float)y - sun_cy;
+                float d  = sqrtf(dx * dx + dy * dy);
+
+                float r = base_r, g = base_g, b = base_b;
+
+                if (d <= SUN_R) {
+                    /* Disc: hot white-gold core fading to orange at the rim,
+                     * and redder overall while the sun is low on the horizon. */
+                    float f      = d / SUN_R;                 /* 0 core..1 rim */
+                    float redden = clampf(1.0f - p, 0.0f, 1.0f);
+                    float cr = 255.0f;
+                    float cg = lerpf(238.0f, 150.0f, f) - redden * 70.0f;
+                    float cb = lerpf(190.0f,  40.0f, f) - redden * 20.0f;
+                    float hot = 2.0f - f;                     /* brighten centre */
+                    r = cr * hot;
+                    g = clampf(cg, 0.0f, 255.0f) * hot;
+                    b = clampf(cb, 0.0f, 255.0f) * hot;
+                } else {
+                    /* Warm halo bleeding into the sky around the disc. */
+                    float glow = clampf(1.0f - (d - SUN_R) / SUN_GLOW, 0.0f, 1.0f);
+                    glow *= glow;
+                    r += 255.0f * glow * 0.9f;
+                    g += 130.0f * glow * 0.9f;
+                    b +=  40.0f * glow * 0.7f;
                 }
+
+                put_px(strip, x, y, r, g, b);
             }
         }
-
-        draw_bpm(strip, g_bpm);
 
         ESP_ERROR_CHECK(led_strip_refresh(strip));
         vTaskDelay(pdMS_TO_TICKS(33));   /* ~30 fps */
@@ -238,7 +241,6 @@ void app_main(void)
     bool was_above = false;
     int64_t last_beat_us = 0;
     int64_t led_off_at_us = 0;
-    float bpm_smooth = 0.0f;     /* EMA of the inter-beat rate for the panel */
 
     while (1) {
         int raw = 0;
@@ -258,16 +260,11 @@ void app_main(void)
         bool above = (acf > thr) && (acf > HB_MIN_AMPLITUDE);
 
         if (above && !was_above && (now - last_beat_us) > HB_REFRACTORY_US) {
-            int inst = last_beat_us ? (int)(60000000LL / (now - last_beat_us)) : 0;
+            int bpm = last_beat_us ? (int)(60000000LL / (now - last_beat_us)) : 0;
             last_beat_us = now;
             led_off_at_us = now + HB_FLASH_MS * 1000;
-            g_last_beat_us = now;        /* drives the matrix throb */
-            if (inst >= 30 && inst <= 220) {
-                bpm_smooth = (bpm_smooth <= 0.0f)
-                             ? (float)inst
-                             : bpm_smooth * 0.7f + (float)inst * 0.3f;
-                g_bpm = (int)(bpm_smooth + 0.5f);
-                ESP_LOGI(TAG, "beat  ~%d bpm", g_bpm);
+            if (bpm) {
+                ESP_LOGI(TAG, "beat  ~%d bpm", bpm);
             } else {
                 ESP_LOGI(TAG, "beat  (first)");
             }
