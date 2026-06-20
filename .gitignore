@@ -1,5 +1,6 @@
 # ESP-IDF build output
 build/
+build_verify
 
 # Generated sdkconfig (reproduced from sdkconfig.defaults) and backups
 sdkconfig
